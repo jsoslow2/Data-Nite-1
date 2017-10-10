@@ -1,0 +1,651 @@
+```{r}
+rm(list=ls())
+```
+
+```{r}
+install.packages("sqldf")
+install.packages("randomForest")
+install.packages("dplyr")
+install.packages("ggplot2")
+install.packages("ROCR",dep=T)
+install.packages("glmnet")
+install.packages("MASS")
+install.packages("gbm")
+install.packages("arm")
+install.packages("e1071")
+install.packages("lrm")
+install.packages("Boruta")
+install.packages("caret")
+install.packages("ggplot2")
+install.packages("ggthemr")
+install.packages("ggthemes")
+install.packages("gridExtra")
+install.packages("grid")
+install.packages("broom")
+install.packages("scales")
+install.packages("tidyr")
+install.packages("dplyr")
+install.packages('DiagrammeR')
+install.packages ('mlrMBO')
+install.packages('parallelMap')
+install.packages('DiceKriging')
+install.packages('plyr')
+install.packages('DataCombine')
+```
+
+```{r}
+install.packages("drat", repos="https://cran.rstudio.com")
+drat:::addRepo("dmlc")
+install.packages("xgboost", repos="http://dmlc.ml/drat/", type = "source")
+install.packages('xgboost')
+```
+
+
+```{r}
+library(ROCR)
+library(randomForest)
+library(glmnet)
+library(MASS)
+library(gbm)
+library(sqldf)
+library(arm)
+library(Boruta)
+library(caret)
+library(xgboost)
+library(e1071)
+library(ggplot2)
+library(ggthemes)
+library(gridExtra)
+library(grid)
+library(broom)
+library(tidyr)
+library(dplyr)
+library(scales)
+library(methods)
+library(data.table)
+library(magrittr)
+library(Matrix)
+library(DataCombine)
+```
+
+#Load 2015 Data
+```{r}
+getwd()
+setwd("/Users/jacksoslow/Downloads")
+football_base <- read.csv('football.csv')
+football2 <- read.csv('NFLPlayByPlay2015.csv')
+```
+
+#Data Cleaning and Feature Engineering
+```{r}
+football <- football_base
+football$TimeSecs <- ((4 -football$Quarter) * 900) + (60 * football$Minute) + football$Second
+
+
+football$time <- paste(football$Minute, football$Second,  sep = ":")
+football <- sqldf('Select football.*,  yrdline100, PosTeamScore, DefTeamScore, ScoreDiff from football
+      join football2
+      on football.gameID = football2.gameID
+      and football.TimeSecs = football2.TimeSecs')
+
+football <- sqldf('Select * from football
+order by GameID, TimeSecs desc')
+
+
+football <- sqldf("Select * from football
+  where PlayType in ('RUSH', 'PASS', 'TIMEOUT')")
+
+football <- transform(football, newvar=paste(football$OffenseTeam, as.character(football$GameId)))
+names(football)[names(football) == 'newvar'] <- 'BallTeam'
+
+#TIMEOUTS USED
+football$timeoutindicator <- ifelse(football$PlayType == 'TIMEOUT', 1, 0)
+
+shift<-function(x,shift_by){
+	stopifnot(is.numeric(shift_by))
+	stopifnot(is.numeric(x))
+
+	if (length(shift_by)>1)
+		return(sapply(shift_by,shift, x=x))
+
+	out<-NULL
+	abs_shift_by=abs(shift_by)
+	if (shift_by > 0 )
+		out<-c(tail(x,-abs_shift_by),rep(NA,abs_shift_by))
+	else if (shift_by < 0 )
+		out<-c(rep(NA,abs_shift_by), head(x,-abs_shift_by))
+	else 
+		out<-x
+	out
+}
+football$timeoutindicatorlead<-shift(football$timeoutindicator,-1)
+football <- sqldf("Select * from football 
+             where PlayType in ('PASS', 'RUSH')")
+football$halfindicator <- ifelse (football$Quarter <= 2, 1, 2)
+football <- transform(football, newvar=paste(football$BallTeam, as.character(football$halfindicator)))
+names(football)[names(football) == 'newvar'] <- 'BallTeamXhalf'
+football$TimeoutsUsed <- ave(football$timeoutindicatorlead, football$BallTeamXhalf, FUN=cumsum)
+football$TimeoutsLeft <- 3 - football$TimeoutsUsed
+
+
+
+
+football$RushInGame <- ave(football$IsRush, football$BallTeam, FUN=cumsum)
+football$RushInGame <- lag(football$RushInGame, 1)
+football$PassInGame <- ave(football$IsPass, football$BallTeam, FUN=cumsum)
+football$PassInGame <- lag(football$PassInGame, 1)
+
+
+football <- sqldf("Select * from football
+                  where formation not in ('Field Goal')")
+
+football$Down <- as.character(football$Down)
+football <- sqldf("Select football.*, case when Down = 1 then 'First'
+                      when Down = 2 then 'Second'
+                     when  Down = 3 then 'Third'
+                     Else 'Fourth' end as DownClean from football")
+
+football <- sqldf("Select football.*, case when ToGo > 12 then 12
+                       else ToGo end as togoclean from football")
+
+football <- transform(football, newvar=paste(DownClean, as.character(football$togoclean)))
+names(football)[names(football) == 'newvar'] <- 'DownAndDistance'
+
+football <- sqldf("Select football.*, 
+      case when ScoreDiff < -14 then -14
+       when ScoreDiff < -7 then -7
+       when ScoreDiff < -3 then -3
+       when ScoreDiff < 4 then 0
+       when ScoreDiff < 8 then 3
+       when ScoreDiff < 15 then 7
+      else 14
+      end as ScoreDiffExpand
+      from football")
+
+football <- sqldf("Select football.*, 
+      case when ScoreDiff is null then 0
+      else ScoreDiff
+      end as ScoreDiffClean
+      from football")
+
+football <- sqldf("Select football.*, 
+          case when TimeSecs > 3550 then 3550 
+           when TimeSecs > 3500 then 3500
+           when TimeSecs > 3450 then 3450
+           when TimeSecs > 3400 then 3400
+           when TimeSecs > 3350 then 3350
+           when TimeSecs > 3300 then 3300
+           when TimeSecs > 3250 then 3250
+           when TimeSecs > 3200 then 3200
+           when TimeSecs > 3150 then 3150
+           when TimeSecs > 3100 then 3100
+           when TimeSecs > 3050 then 3050
+           when TimeSecs > 3000 then 3000
+           when TimeSecs > 2950 then 2950
+           when TimeSecs > 2900 then 2900
+           when TimeSecs > 2850 then 2850
+           when TimeSecs > 2800 then 2800
+           when TimeSecs > 2750 then 2750
+           when TimeSecs > 2700 then 2700
+           when TimeSecs > 2650 then 2650
+           when TimeSecs > 2600 then 2600
+           when TimeSecs > 2550 then 2550
+           when TimeSecs > 2500 then 2500
+           when TimeSecs > 2450 then 2450
+           when TimeSecs > 2400 then 2400
+           when TimeSecs > 2350 then 2350
+           when TimeSecs > 2300 then 2300
+           when TimeSecs > 2250 then 2250
+           when TimeSecs > 2200 then 2200
+           when TimeSecs > 2150 then 2150
+           when TimeSecs > 2100 then 2100
+           when TimeSecs > 2050 then 2050
+           when TimeSecs > 2000 then 2000
+           when TimeSecs > 1950 then 1950
+           when TimeSecs > 1900 then 1900
+           when TimeSecs > 1850 then 1850
+           when TimeSecs > 1800 then 1800
+           when TimeSecs > 1750 then 1750
+           when TimeSecs > 1700 then 1700
+           when TimeSecs > 1650 then 1650
+           when TimeSecs > 1600 then 1600
+           when TimeSecs > 1550 then 1550
+           when TimeSecs > 1500 then 1500
+           when TimeSecs > 1450 then 1450
+           when TimeSecs > 1400 then 1400
+           when TimeSecs > 1350 then 1350
+           when TimeSecs > 1300 then 1300
+           when TimeSecs > 1250 then 1250
+           when TimeSecs > 1200 then 1200
+           when TimeSecs > 1150 then 1150
+           when TimeSecs > 1100 then 1100
+           when TimeSecs > 1050 then 1050
+           when TimeSecs > 1000 then 1000
+           when TimeSecs > 950 then 950
+           when TimeSecs > 900 then 900
+           when TimeSecs > 850 then 850
+           when TimeSecs > 800 then 800
+           when TimeSecs > 750 then 750
+           when TimeSecs > 700 then 700
+           when TimeSecs > 650 then 650
+           when TimeSecs > 600 then 600
+           when TimeSecs > 550 then 550
+           when TimeSecs > 500 then 500
+           when TimeSecs > 450 then 450
+           when TimeSecs > 400 then 400
+           when TimeSecs > 350 then 350
+           when TimeSecs > 300 then 300
+           when TimeSecs > 250 then 250
+           when TimeSecs > 200 then 200
+           when TimeSecs > 150 then 150
+           when TimeSecs > 100 then 100
+           when TimeSecs > 50 then 50
+                  else 0 end as TimeSecsClean from football")
+
+football$rownumber <- 1:nrow(football)
+
+football<- sqldf("Select * from football
+      group by rownumber, GameId
+      order by GameId, TimeSecs desc")
+
+
+
+
+football$ScoreAndTime <- football$ScoreDiff / football$TimeSecs
+football$ScoreAndTime[which(!is.finite(football$ScoreAndTime))] <- 0
+summary(football$ScoreAndTime)
+
+
+
+football$percentrun <- ifelse(football$PassInGame == 0, 0, football$RushInGame / (football$RushInGame + football$PassInGame))
+
+football$ConsecutiveRuns <- with(football, ave(football$IsRush, cumsum(football$IsRush == 0), FUN = cumsum))
+football <- slide(football, Var = "ConsecutiveRuns", slideBy = -1)
+football[is.na(football)] <- 0
+football$ConsecutiveRuns <- ifelse(football$TimeSecs == 3600, 0, football$ConsecutiveRuns)
+
+football$LastPlayRun <- lag(football$IsRush, 1)
+
+football$ConsecutiveRuns <- lag(football$ConsecutiveRuns)
+
+
+football$lagballteam <- lag(football$BallTeam, 1)
+football$possesionchangeindicator <- ifelse(football$BallTeam == football$lagballteam, 0, 1)
+football$possesion <- ave(football$possesionchangeindicator, football$GameId, FUN=cumsum)
+
+football$interceptindicator <- ifelse(grepl("INTERCEPT", football$Description) == "TRUE", 1, 0)
+football$fumbleindicator <- ifelse(grepl("FUMBLE", football$Description) == "TRUE", 1, 0)
+
+football <- sqldf("Select football.*, 
+case when a.GameId > 0 then 1
+else 0 end as PostPickPossession 
+from football
+left join (Select * from (Select * from football
+      where interceptindicator = 1) a
+      join football
+      on football.rownumber = a.rownumber) a
+on a.rownumber = football.rownumber")
+
+football <- sqldf("Select football.*, 
+case when a.GameId > 0 then 1
+else 0 end as PostFumblePossession 
+from football
+left join (Select * from (Select * from football
+      where fumbleindicator = 1) a
+      join football
+      on football.rownumber = a.rownumber) a
+on a.rownumber = football.rownumber")
+
+
+football$lagdesc <- lag(football$Description, 1)
+football$last_passer <- ifelse(grepl("ROMO", football$lagdesc) == "TRUE", "Romo", "Else")
+football$last_passer[grepl("CASSEL", football$lagdesc)] <- "Cassel"
+football$last_passer[grepl("MOORE", football$lagdesc)] <- "Moore"
+football$last_passer[grepl("WEEDEN", football$lagdesc)] <- "Weeden"
+
+
+football$last_runner <- ifelse(grepl("RANDLE", football$lagdesc) == "TRUE", "Randle", "Else")
+football$last_runner[grepl("MCFADDEN", football$lagdesc)] <- "McFadden"
+football$last_runner[grepl("DUNBAR", football$lagdesc)] <- "Dunbar"
+football$last_runner[grepl("TURBIN", football$lagdesc)] <- "Turbin"
+```
+#Team Selection and Cardinality Cleaning
+```{r}
+unique(football$OffenseTeam)
+table <- football
+#table <- subset(table, table$OffenseTeam == 'DAL')
+
+table <- table[!(as.numeric(table$Formation) %in% which(table(table$Formation)<20)),]
+table <- table[!(as.numeric(table$DownAndDistance) %in% which(table(table$DownAndDistance)<10)),]
+```
+
+#Table Creation
+```{r}
+x <- table[, c('IsRush'
+               ,'Quarter'
+               ,'Second'
+               ,'Minute'
+               , 'OffenseTeam'
+               , 'DefenseTeam'
+               , 'Down'
+               , 'ToGo'
+               , 'YardLine'
+               , 'SeriesFirstDown'
+               , 'Formation'
+               , 'DownAndDistance'
+               , 'yrdline100'
+               , 'PosTeamScore'
+               , 'DefTeamScore'
+               , 'TimeSecsClean'
+               , 'ScoreDiffExpand'
+               , 'RushInGame'
+               , 'PassInGame'
+               , 'percentrun'
+               , 'TimeoutsLeft'
+               , 'ConsecutiveRuns'
+               , 'LastPlayRun'
+               , 'possesion'
+               , 'PostPickPossession'
+               , 'PostFumblePossession'
+              , 'ScoreAndTime'
+              )]
+
+x <- x[complete.cases(x), ]
+
+toptable <- head(x, n=5000)
+tailtable <- tail(x, n=5000)
+#Sample Indexes
+indexes = sample(1:nrow(x), size=0.2*nrow(x))
+ 
+# Split data
+test = x[indexes,]
+dim(test)  # 6 11
+train = x[-indexes,]
+dim(train) # 26 11
+```
+
+
+#Logistic Regression
+```{r}
+logit <- glm(IsRush ~.
+              ,family = binomial, data=train)
+summary(logit)
+```
+#Logistic Error
+```{r}
+p <- predict(logit, test, type="response")
+pr <- prediction(p, test$IsRush)
+prflogit <- performance(pr, "tpr", "fpr")
+plot(prflogit)
+
+auc <- performance(pr, measure = "auc")
+auc <- auc@y.values[[1]]
+auc
+```
+```{r}
+svmmodel <- svm(IsRush ~ ., data=train)
+```
+
+```{r}
+p <- predict(svmmodel, test, type="response")
+pr <- prediction(p, test$IsRush)
+prfsvm <- performance(pr, "tpr", "fpr")
+plot(prfsvm)
+
+auc <- performance(pr, measure = "auc")
+auc <- auc@y.values[[1]]
+auc
+```
+
+```{r}
+blackbox <- randomForest(IsRush ~ .
+            , data=train, ntrees=500)
+blackbox
+varImpPlot(blackbox, type=2)
+```
+
+
+```{r}
+p <- predict(blackbox, test, type="response")
+pr <- prediction(p, test$IsRush)
+prfrf <- performance(pr, measure = "tpr", x.measure = "fpr")
+plot(prfrf)
+
+auc <- performance(pr, measure = "auc")
+auc <- auc@y.values[[1]]
+auc
+```
+
+
+
+
+
+```{r}
+sparse_matrix <- sparse.model.matrix(IsRush~.-1, data = train)
+output_vector = train[,1]
+sparse_matrix_test <- sparse.model.matrix(IsRush~.-1, data = test)
+output_vector_test <- test[,1]
+```
+
+
+
+
+```{r}
+bst <- xgboost( data = sparse_matrix, label = output_vector, max_depth = 7, eta = .01, nthread = 2, nrounds = 1200,gamma = 0, min_child_weight = 1, subsample= .7, colsample_bytree=.7, objective = "binary:logistic")
+```
+
+
+
+```{r}
+p <- predict(bst, sparse_matrix_test, type="response")
+pr <- prediction(p, output_vector_test)
+prfxg <- performance(pr,"tpr","fpr")
+plot(prfxg)
+
+auc <- performance(pr, measure = "auc")
+auc <- auc@y.values[[1]]
+auc
+```
+
+```{r}
+plot(prfsvm, col = 'RED')
+plot(prflogit, add = TRUE, col = 'GREEN')
+plot(prfrf, add = TRUE, col = 'Orange')
+plot(prfxg, add = TRUE, col = 'BLUE')
+abline(a=0, b= 1)
+
+
+legend(.6, .5, legend=c("Random","SVM", "Logit", "RandomForest", "XGBoost"),
+       col=c("Black", "red", "green", "Orange", "Blue"), lty=1)
+```
+
+
+
+```{r}
+importance <- xgb.importance(feature_names = colnames(sparse_matrix), model = bst)
+importance
+xgb.plot.importance(importance_matrix = importance)
+mat <- xgb.importance (feature_names = colnames(sparse_matrix),model = bst)
+xgb.plot.importance (importance_matrix = mat[1:20]) 
+```
+
+
+```{r}
+xgb.plot.tree(model = bst, n_first_tree = 1)
+```
+
+
+```{r}
+# prediction
+train$prediction <- predict(blackbox, newdata = train, type = "response" )
+test$prediction  <- predict(blackbox, newdata = test , type = "response" )
+
+# distribution of the prediction score grouped by known outcome
+ggplot(test, aes( prediction, color = as.factor(IsRush) ) ) + 
+geom_density( size = 1 ) +
+ggtitle( "Test Set's Predicted Score" ) + 
+scale_color_economist( name = "data", labels = c( "negative", "positive" ) ) + 
+theme_economist()
+```
+
+
+```{r}
+accuracy_info <- AccuracyCutoffInfo( train = train, test = test, 
+                                     predict = "prediction", actual = "IsRush" )
+accuracy_info$plot
+```
+
+```{r}
+cm_info <- ConfusionMatrixInfo( data = test, predict = "prediction", 
+                                actual = "IsRush", cutoff = .5 )
+cm_info$plot
+```
+```{r}
+cost_fp <- 100
+cost_fn <- 100
+roc_info <- ROCInfo( data = cm_info$data, predict = "predict", 
+                     actual = "actual", cost.fp = cost_fp, cost.fn = cost_fn )
+plot(roc_info$plot)
+```
+
+
+
+```{r}
+Passes <- test[order(test$prediction),]
+Runs <- test[order(-test$prediction),]
+head(Runs)
+head(Passes)
+```
+
+```{r}
+xcode-select --install
+install.packages("mlr")
+library(mlr)
+library(DiagrammeR)
+library(devtools)
+install.packages('ggvis')
+install.packages('mlrMBO')
+library(mlrMBO)
+library(parallelMap)
+library(DiceKriging)
+```
+
+```{r}
+train$Down <- as.factor(train$Down)
+lrn = makeLearner("classif.xgboost", eval_metric = "auc", predict.type = "prob")
+
+ps = makeParamSet(
+  makeIntegerParam("nrounds", lower = 200, upper = 2500, default = 200),
+  makeNumericParam("eta", lower = -7, upper = -5, default = -6, 
+    trafo = function(x) 2^x),
+  makeIntegerParam("max_depth", lower = 3, upper = 15, default = 3),
+  makeNumericParam("colsample_bytree", lower = 0.3, upper = 1, default = 0.6),
+  makeNumericParam("subsample", lower = 0.3, upper = 1, default = 0.6)
+)
+
+task = makeClassifTask(data = train, target = "IsRush")
+mbo.ctrl = makeMBOControl(save.on.disk.at = c(0, 5, 10, 20, 50, 75, 85, 95))
+mbo.ctrl = setMBOControlTermination(mbo.ctrl, iters = 100)
+surrogate.lrn = makeLearner("regr.km", predict.type = "se")
+ctrl = mlr:::makeTuneControlMBO(learner = surrogate.lrn, mbo.control = mbo.ctrl)
+res.mbo = tuneParams(lrn, task, cv10, par.set = ps, control = ctrl)
+parallelStop()
+```
+
+
+
+```{r}
+median_tic <- train %>% group_by(ScoreAndTime) %>% 
+                       summarise( prediction = median(prediction), count = n() )
+ggplot( median_tic, aes(ScoreAndTime, prediction, size = count ) ) + 
+geom_point() + theme( legend.position = "none" ) + geom_smooth(method="loess",se=TRUE) +
+labs( title = "Past Purchases", y = "Attrition Probability", 
+      x = "Past Purchases" ) 
+```
+```{r}
+median_tic <- train %>% group_by(DownAndDistance) %>% 
+                       summarise( prediction = median(prediction), count = n() )
+ggplot( median_tic, aes(DownAndDistance, prediction, size = count ) ) + 
+geom_point() + theme( legend.position = "none" ) +
+labs( title = "Past Purchases", y = "Attrition Probability", 
+      x = "Time Spent in the Company" ) 
+```
+
+```{r}
+median_tic <- train %>% group_by(Formation) %>% 
+                       summarise( prediction = median(prediction), count = n() )
+ggplot( median_tic, aes( Formation, prediction, size = count ) ) + 
+geom_point() + theme( legend.position = "none" ) +
+labs( title = "Channel", y = "Attrition Probability", 
+      x = "Channel" ) 
+```
+```{r}
+median_tic <- train %>% group_by(yrdline100) %>% 
+                       summarise( prediction = median(prediction), count = n() )
+ggplot( median_tic, aes( yrdline100, prediction, size = count ) ) + 
+geom_point() + theme( legend.position = "none" ) + geom_smooth(method="loess",se=TRUE)+
+labs( title = "Past Purchases", y = "Attrition Probability", 
+      x = "Time Spent in the Company" ) 
+```
+```{r}
+median_tic <- train %>% group_by(RushInGame) %>% 
+                       summarise( prediction = median(prediction), count = n() )
+ggplot( median_tic, aes( RushInGame, prediction, size = count ) ) + 
+geom_point() + theme( legend.position = "none" ) + geom_smooth(method="loess",se=TRUE) +
+labs( title = "Past Purchases", y = "Attrition Probability", 
+      x = "Time Spent in the Company" ) 
+```
+
+```{r}
+median_tic <- train %>% group_by(PassInGame) %>% 
+                       summarise( prediction = median(prediction), count = n() )
+ggplot( median_tic, aes( PassInGame, prediction, size = count ) ) + 
+geom_point() + theme( legend.position = "none" ) + geom_smooth(method="loess",se=TRUE) +
+labs( title = "NRD vs Predicted Churn", y = "Attrition Probability", 
+      x = "NRD" ) 
+
+```
+
+```{r}
+
+median_tic <- train %>% group_by(TimeSecsClean) %>% 
+                       summarise( prediction = median(prediction), count = n() )
+ggplot( median_tic, aes( TimeSecsClean, prediction, size = count ) ) + 
+geom_point() + theme( legend.position = "none" ) + geom_smooth(method="loess",se=TRUE) +
+labs( title = "NRD vs Predicted Churn", y = "Attrition Probability", 
+      x = "NRD" ) 
+
+```
+
+
+```{r}
+train$round_percentrun <- round(train$percentrun, 2)  
+median_tic <- train %>% group_by(round_percentrun) %>% 
+                       summarise( prediction = median(prediction), count = n() )
+ggplot( median_tic, aes( round_percentrun, prediction, size = count ) ) + 
+geom_point() + theme( legend.position = "none" ) + geom_smooth(method="loess",se=TRUE) +
+labs( title = "Purchase Likelihood vs Churn", y = "Attrition Probability", 
+      x = "Purchase Likelihood" )
+```
+```{r}
+test$error <- ifelse(test$prediction > .5 & test$IsRush == 1, 0, 1)
+test$error[test$prediction < .5 & test$IsRush == 0] <- 0
+
+train$error <- ifelse(train$prediction > .5 & train$IsRush == 1, 0, 1)
+train$error[train$prediction < .5 & train$IsRush == 0] <- 0
+```
+
+```{r}
+write.csv(train, "trainingset.csv")
+write.csv(test, "testset.csv")
+```
+
+```{r}
+plot(errorsbytime$TimeSecsClean, errorsbytime$errors)
+abline(lm(errors ~ TimeSecsClean, data=errorsbytime))
+
+summary(lm(errors ~ TimeSecsClean, data=errorsbytime))
+```
+
+
+
